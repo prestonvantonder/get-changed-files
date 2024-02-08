@@ -1,14 +1,84 @@
 import * as core from '@actions/core'
-import {context, GitHub} from '@actions/github'
+import * as github from '@actions/github'
+import {Context} from '@actions/github/lib/context'
+import {git} from './git-helper'
+import path from 'path'
 
 type Format = 'space-delimited' | 'csv' | 'json'
 type FileStatus = 'added' | 'modified' | 'removed' | 'renamed'
+type Event = 'pull_request' | 'push' | 'workflow_dispatch'
+type Handler = (context: Context) => Promise<{base: string; head: string}>
+
+const panic = (message: string): never => {
+  core.setFailed(message)
+  process.exit(1)
+}
+
+const handleWorkflowDispatchEvent = async (context: Context): Promise<{base: string; head: string}> => {
+  core.info(`Handling workflow dispatch event with payload: ${JSON.stringify(context)}`)
+  const head = context.sha
+  const parent = (await git(['-P', 'branch'])).match(/develop|main|master/)
+  if (!parent || !parent.length) {
+    panic('No parent branch found')
+  }
+  const base = parent![0]
+  core.debug(`Output of command: ${base}`)
+  const statuses = (await git(['-P', 'diff', '--name-status', base, head]))
+    .split('\n')
+    .filter(Boolean)
+    .map(it => {
+      const raw = it.trim().substring(0, 1)
+      switch (raw) {
+        case 'A':
+          return 'added'
+        case 'M':
+          return 'modified'
+        case 'D':
+          return 'removed'
+        case 'R':
+          return 'renamed'
+        default:
+          return ''
+      }
+    })
+  const files = (await git(['-P', 'diff', '--name-only', base, head]))
+    .split('\n')
+    .filter(Boolean)
+    .map((it, index) => ({name: it, status: statuses[index] as FileStatus}))
+  core.debug(`Files: ${JSON.stringify(files)}`)
+  return {base, head}
+}
+
+const handlePushEvent = (context: Context): Promise<{base: string; head: string}> => {
+  core.info(`Handling push event with payload: ${JSON.stringify(context)}`)
+  return Promise.resolve({
+    base: context.payload.before,
+    head: context.payload.after
+  })
+}
+
+const handlePullRequestEvent = (context: Context): Promise<{base: string; head: string}> => {
+  core.info(`Handling pull request event with payload: ${JSON.stringify(context)}`)
+  return Promise.resolve({
+    base: context.payload.pull_request?.base?.sha,
+    head: context.payload.pull_request?.head?.sha
+  })
+}
+
+const context = github.context
+
+const handlers: {[key in Event]: Handler} = {
+  pull_request: handlePullRequestEvent,
+  push: handlePushEvent,
+  workflow_dispatch: handleWorkflowDispatchEvent
+}
 
 async function run(): Promise<void> {
   try {
     // Create GitHub client with the API token.
-    const client = new GitHub(core.getInput('token', {required: true}))
-    const format = core.getInput('format', {required: true}) as Format
+    const client = github.getOctokit(core.getInput('token', {required: true}))
+    const format = (core.getInput('format') as Format) || 'space-delimited'
+    const extensions = (core.getInput('extensions') || '').split(' ').map(it => it.trim())
 
     // Ensure that the format parameter is set properly.
     if (format !== 'space-delimited' && format !== 'csv' && format !== 'json') {
@@ -19,51 +89,24 @@ async function run(): Promise<void> {
     core.debug(`Payload keys: ${Object.keys(context.payload)}`)
 
     // Get event name.
-    const eventName = context.eventName
+    const eventName = context.eventName as Event
 
     // Define the base and head commits to be extracted from the payload.
-    let base: string | undefined
-    let head: string | undefined
-
-    switch (eventName) {
-      case 'pull_request':
-        base = context.payload.pull_request?.base?.sha
-        head = context.payload.pull_request?.head?.sha
-        break
-      case 'push':
-        base = context.payload.before
-        head = context.payload.after
-        break
-      default:
-        core.setFailed(
-          `This action only supports pull requests and pushes, ${context.eventName} events are not supported. ` +
-            "Please submit an issue on this action's GitHub repo if you believe this in correct."
-        )
-    }
+    const {base, head} = await handlers[eventName](context)
 
     // Log the base and head commits
     core.info(`Base commit: ${base}`)
     core.info(`Head commit: ${head}`)
 
-    // Ensure that the base and head properties are set on the payload.
-    if (!base || !head) {
-      core.setFailed(
-        `The base and head commits are missing from the payload for this ${context.eventName} event. ` +
-          "Please submit an issue on this action's GitHub repo."
-      )
-
-      // To satisfy TypeScript, even though this is unreachable.
-      base = ''
-      head = ''
-    }
+    const {repo, owner} = context.repo
 
     // Use GitHub's compare two commits API.
     // https://developer.github.com/v3/repos/commits/#compare-two-commits
-    const response = await client.repos.compareCommits({
+    const response = await client.rest.repos.compareCommits({
       base,
       head,
-      owner: context.repo.owner,
-      repo: context.repo.repo
+      owner,
+      repo
     })
 
     // Ensure that the request was successful.
@@ -83,14 +126,17 @@ async function run(): Promise<void> {
     }
 
     // Get the changed files from the response payload.
-    const files = response.data.files
-    const all = [] as string[],
-      added = [] as string[],
-      modified = [] as string[],
-      removed = [] as string[],
-      renamed = [] as string[],
-      addedModified = [] as string[]
-    for (const file of files) {
+    const files = response.data.files?.filter(
+      it => extensions.includes(path.extname(it.filename)) || extensions.includes('')
+    )
+    core.info(`Files: ${JSON.stringify(files)}`)
+    const all: string[] = [],
+      added: string[] = [],
+      modified: string[] = [],
+      removed: string[] = [],
+      renamed: string[] = [],
+      addedModifiedRenamed: string[] = []
+    files?.forEach(file => {
       const filename = file.filename
       // If we're using the 'space-delimited' format and any of the filenames have a space in them,
       // then fail the step.
@@ -104,24 +150,25 @@ async function run(): Promise<void> {
       switch (file.status as FileStatus) {
         case 'added':
           added.push(filename)
-          addedModified.push(filename)
+          addedModifiedRenamed.push(filename)
           break
         case 'modified':
           modified.push(filename)
-          addedModified.push(filename)
+          addedModifiedRenamed.push(filename)
           break
         case 'removed':
           removed.push(filename)
           break
         case 'renamed':
           renamed.push(filename)
+          addedModifiedRenamed.push(filename)
           break
         default:
           core.setFailed(
             `One of your files includes an unsupported file status '${file.status}', expected 'added', 'modified', 'removed', or 'renamed'.`
           )
       }
-    }
+    })
 
     // Format the arrays of changed files.
     let allFormatted: string,
@@ -144,7 +191,7 @@ async function run(): Promise<void> {
         modifiedFormatted = modified.join(' ')
         removedFormatted = removed.join(' ')
         renamedFormatted = renamed.join(' ')
-        addedModifiedFormatted = addedModified.join(' ')
+        addedModifiedFormatted = addedModifiedRenamed.join(' ')
         break
       case 'csv':
         allFormatted = all.join(',')
@@ -152,7 +199,7 @@ async function run(): Promise<void> {
         modifiedFormatted = modified.join(',')
         removedFormatted = removed.join(',')
         renamedFormatted = renamed.join(',')
-        addedModifiedFormatted = addedModified.join(',')
+        addedModifiedFormatted = addedModifiedRenamed.join(',')
         break
       case 'json':
         allFormatted = JSON.stringify(all)
@@ -160,7 +207,7 @@ async function run(): Promise<void> {
         modifiedFormatted = JSON.stringify(modified)
         removedFormatted = JSON.stringify(removed)
         renamedFormatted = JSON.stringify(renamed)
-        addedModifiedFormatted = JSON.stringify(addedModified)
+        addedModifiedFormatted = JSON.stringify(addedModifiedRenamed)
         break
     }
 
@@ -170,7 +217,7 @@ async function run(): Promise<void> {
     core.info(`Modified: ${modifiedFormatted}`)
     core.info(`Removed: ${removedFormatted}`)
     core.info(`Renamed: ${renamedFormatted}`)
-    core.info(`Added or modified: ${addedModifiedFormatted}`)
+    core.info(`Added or modified or renamed: ${addedModifiedFormatted}`)
 
     // Set step output context.
     core.setOutput('all', allFormatted)
@@ -183,7 +230,7 @@ async function run(): Promise<void> {
     // For backwards-compatibility
     core.setOutput('deleted', removedFormatted)
   } catch (error) {
-    core.setFailed(error.message)
+    if (error instanceof Error) core.setFailed(error.message)
   }
 }
 
