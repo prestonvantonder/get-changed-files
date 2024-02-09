@@ -20,6 +20,10 @@ inputs:
       Can be 'space-delimited', 'csv', or 'json'.
     required: true
     default: space-delimited
+  extensions:
+    description: >
+      List of space-delimited file extensions to include.
+    required: false
 outputs:
   all:
     description: >
@@ -36,9 +40,9 @@ outputs:
   renamed:
     description: >
       Array of renamed files.
-  added_modified:
+  added_modified_renamed:
     description: >
-      Array of all added and modified files.
+      Array of all added, modified and renamed files.
   # For backwards-compatibility
   deleted:
     description: >
