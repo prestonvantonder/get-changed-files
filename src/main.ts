@@ -1,14 +1,19 @@
 import * as core from '@actions/core'
-import {context, GitHub} from '@actions/github'
+import * as github from '@actions/github'
+import path from 'path'
+import {Event, GitHubClient, handlers} from './github-event-handlers'
 
 type Format = 'space-delimited' | 'csv' | 'json'
 type FileStatus = 'added' | 'modified' | 'removed' | 'renamed'
 
 async function run(): Promise<void> {
   try {
+    const context = github.context
     // Create GitHub client with the API token.
-    const client = new GitHub(core.getInput('token', {required: true}))
-    const format = core.getInput('format', {required: true}) as Format
+    const token = core.getInput('token', {required: true})
+    const client: GitHubClient = github.getOctokit(token)
+    const format = (core.getInput('format') as Format) || 'space-delimited'
+    const extensions = (core.getInput('extensions') || '').split(' ').map(it => it.trim())
 
     // Ensure that the format parameter is set properly.
     if (format !== 'space-delimited' && format !== 'csv' && format !== 'json') {
@@ -16,82 +21,36 @@ async function run(): Promise<void> {
     }
 
     // Debug log the payload.
-    core.debug(`Payload keys: ${Object.keys(context.payload)}`)
+    core.debug(`payload: ${Object.keys(context.payload)}`)
 
     // Get event name.
-    const eventName = context.eventName
+    const eventName = context.eventName as Event
+    const {repo, owner} = context.repo
+    const {sha, payload, serverUrl} = context
 
     // Define the base and head commits to be extracted from the payload.
-    let base: string | undefined
-    let head: string | undefined
-
-    switch (eventName) {
-      case 'pull_request':
-        base = context.payload.pull_request?.base?.sha
-        head = context.payload.pull_request?.head?.sha
-        break
-      case 'push':
-        base = context.payload.before
-        head = context.payload.after
-        break
-      default:
-        core.setFailed(
-          `This action only supports pull requests and pushes, ${context.eventName} events are not supported. ` +
-            "Please submit an issue on this action's GitHub repo if you believe this in correct."
-        )
-    }
-
-    // Log the base and head commits
-    core.info(`Base commit: ${base}`)
-    core.info(`Head commit: ${head}`)
-
-    // Ensure that the base and head properties are set on the payload.
-    if (!base || !head) {
-      core.setFailed(
-        `The base and head commits are missing from the payload for this ${context.eventName} event. ` +
-          "Please submit an issue on this action's GitHub repo."
-      )
-
-      // To satisfy TypeScript, even though this is unreachable.
-      base = ''
-      head = ''
-    }
-
-    // Use GitHub's compare two commits API.
-    // https://developer.github.com/v3/repos/commits/#compare-two-commits
-    const response = await client.repos.compareCommits({
-      base,
-      head,
-      owner: context.repo.owner,
-      repo: context.repo.repo
+    const changedFiles = await handlers[eventName]({
+      sha,
+      payload,
+      eventName,
+      repo,
+      owner,
+      client,
+      serverUrl,
+      token
     })
 
-    // Ensure that the request was successful.
-    if (response.status !== 200) {
-      core.setFailed(
-        `The GitHub API for comparing the base and head commits for this ${context.eventName} event returned ${response.status}, expected 200. ` +
-          "Please submit an issue on this action's GitHub repo."
-      )
-    }
-
-    // Ensure that the head commit is ahead of the base commit.
-    if (response.data.status !== 'ahead') {
-      core.setFailed(
-        `The head commit for this ${context.eventName} event is not ahead of the base commit. ` +
-          "Please submit an issue on this action's GitHub repo."
-      )
-    }
-
     // Get the changed files from the response payload.
-    const files = response.data.files
-    const all = [] as string[],
-      added = [] as string[],
-      modified = [] as string[],
-      removed = [] as string[],
-      renamed = [] as string[],
-      addedModified = [] as string[]
-    for (const file of files) {
-      const filename = file.filename
+    const files = changedFiles?.filter(it => extensions.includes(path.extname(it.name)) || extensions.includes(''))
+    core.debug(`files: ${JSON.stringify(files)}`)
+    const all: string[] = [],
+      added: string[] = [],
+      modified: string[] = [],
+      removed: string[] = [],
+      renamed: string[] = [],
+      addedModified: string[] = []
+    files?.forEach(file => {
+      const filename = file.name
       // If we're using the 'space-delimited' format and any of the filenames have a space in them,
       // then fail the step.
       if (format === 'space-delimited' && filename.includes(' ')) {
@@ -121,7 +80,7 @@ async function run(): Promise<void> {
             `One of your files includes an unsupported file status '${file.status}', expected 'added', 'modified', 'removed', or 'renamed'.`
           )
       }
-    }
+    })
 
     // Format the arrays of changed files.
     let allFormatted: string,
@@ -183,7 +142,7 @@ async function run(): Promise<void> {
     // For backwards-compatibility
     core.setOutput('deleted', removedFormatted)
   } catch (error) {
-    core.setFailed(error.message)
+    if (error instanceof Error) core.setFailed(error.message)
   }
 }
 
