@@ -19,7 +19,10 @@ See [action.yml](action.yml)
     # Format of the steps output context.
     # Can be 'space-delimited', 'csv', or 'json'.
     # Default: 'space-delimited'
-    format: ''
+    format: 'space-delimited'
+    # List of space-delimited extensions to include.
+    # If not specified, all extensions are included.
+    extensions: '.php .js'
 ```
 
 # Scenarios

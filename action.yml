@@ -20,6 +20,10 @@ inputs:
       Can be 'space-delimited', 'csv', or 'json'.
     required: true
     default: space-delimited
+  extensions:
+    description: >
+      List of space-delimited file extensions to include.
+    required: false
 outputs:
   all:
     description: >
